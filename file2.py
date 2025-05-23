@@ -1,694 +1,1070 @@
-#!/usr/bin/env python3
-"""
-LAN File Transfer Application
-A GUI-based tool for sending and receiving files over local network
-"""
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+import os
 import socket
 import threading
-import os
-import json
-import time
-import subprocess
-import platform
-import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.parse
-import shutil
-import tempfile
 from datetime import datetime
-import requests
-import zipfile
+from flask import Flask, render_template, request, jsonify, redirect, url_for, send_file, session
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from werkzeug.utils import secure_filename
+import tkinter as tk
+from tkinter import ttk, scrolledtext, filedialog, messagebox
+import json
+import uuid
 
-class FileTransferServer(BaseHTTPRequestHandler):
-    """HTTP server for handling file transfers"""
-    
-    def do_GET(self):
-        """Handle GET requests"""
-        if self.path == '/':
-            self.send_main_page()
-        elif self.path == '/upload':
-            self.send_upload_page()
-        elif self.path.startswith('/download/'):
-            self.handle_download()
-        elif self.path == '/status':
-            self.send_status()
-        else:
-            self.send_404()
-    
-    def do_POST(self):
-        """Handle POST requests for file uploads"""
-        if self.path == '/upload':
-            self.handle_upload()
-        else:
-            self.send_404()
-    
-    def send_main_page(self):
-        """Send the main page HTML"""
-        html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>File Transfer</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-                .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; text-decoration: none; display: inline-block; }
-                .btn:hover { background: #0056b3; }
-                .file-list { margin: 20px 0; }
-                .file-item { background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 5px; }
-                .upload-area { border: 2px dashed #ccc; padding: 20px; text-align: center; margin: 20px 0; }
-                .status { margin: 10px 0; padding: 10px; border-radius: 5px; }
-                .success { background: #d4edda; color: #155724; }
-                .error { background: #f8d7da; color: #721c24; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>File Transfer Hub</h1>
-                <p>Welcome! You can upload files to share or download available files.</p>
-                
-                <div class="upload-area">
-                    <h3>Upload Files</h3>
-                    <form action="/upload" method="post" enctype="multipart/form-data">
-                        <input type="file" name="file" multiple style="margin: 10px;">
-                        <br>
-                        <button type="submit" class="btn">Upload Files</button>
-                    </form>
-                </div>
-                
-                <div class="file-list">
-                    <h3>Available Files (Shared Space)</h3>
-                    <div id="files">Loading...</div>
-                </div>
-                
-                <script>
-                    function loadFiles() {
-                        fetch('/status')
-                            .then(response => response.json())
-                            .then(data => {
-                                const filesDiv = document.getElementById('files');
-                                if (data.files.length === 0) {
-                                    filesDiv.innerHTML = '<p>No files available for download.</p>';
-                                } else {
-                                    filesDiv.innerHTML = data.files.map(file => 
-                                        `<div class="file-item">
-                                            <strong>${file.name}</strong> (${formatSize(file.size)})
-                                            <a href="/download/${encodeURIComponent(file.name)}" class="btn" style="float: right;">Download</a>
-                                        </div>`
-                                    ).join('');
-                                }
-                            })
-                            .catch(err => {
-                                document.getElementById('files').innerHTML = '<p class="error">Error loading files.</p>';
-                            });
-                    }
-                    
-                    function formatSize(bytes) {
-                        if (bytes === 0) return '0 Bytes';
-                        const k = 1024;
-                        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-                        const i = Math.floor(Math.log(bytes) / Math.log(k));
-                        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-                    }
-                    
-                    loadFiles();
-                    setInterval(loadFiles, 3000); // Refresh every 3 seconds
-                </script>
-            </div>
-        </body>
-        </html>
-        """
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        self.wfile.write(html.encode())
-    
-    def handle_upload(self):
-        """Handle file upload"""
-        try:
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            
-            # Parse multipart form data
-            boundary = self.headers['Content-Type'].split('boundary=')[1]
-            parts = post_data.split(f'--{boundary}'.encode())
-            
-            for part in parts:
-                if b'filename=' in part:
-                    # Extract filename
-                    filename_start = part.find(b'filename="') + 10
-                    filename_end = part.find(b'"', filename_start)
-                    filename = part[filename_start:filename_end].decode()
-                    
-                    if filename:
-                        # Extract file content
-                        file_start = part.find(b'\r\n\r\n') + 4
-                        file_end = part.rfind(b'\r\n')
-                        file_content = part[file_start:file_end]
-                        
-                        # Save file
-                        safe_filename = os.path.basename(filename)
-                        filepath = os.path.join(self.server.shared_folder, safe_filename)
-                        
-                        with open(filepath, 'wb') as f:
-                            f.write(file_content)
-                        
-                        # Update server's file list
-                        if hasattr(self.server, 'app'):
-                            self.server.app.update_status(f"Received file: {safe_filename}")
-            
-            # Send success response
-            self.send_response(302)
-            self.send_header('Location', '/')
-            self.end_headers()
-            
-        except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            error_html = f"<h1>Upload Error</h1><p>{str(e)}</p><a href='/'>Go Back</a>"
-            self.wfile.write(error_html.encode())
-    
-    def handle_download(self):
-        """Handle file download"""
-        try:
-            filename = urllib.parse.unquote(self.path.split('/download/')[1])
-            filepath = os.path.join(self.server.shared_folder, filename)
-            
-            if os.path.exists(filepath) and os.path.isfile(filepath):
-                self.send_response(200)
-                self.send_header('Content-type', 'application/octet-stream')
-                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-                self.send_header('Content-Length', str(os.path.getsize(filepath)))
-                self.end_headers()
-                
-                with open(filepath, 'rb') as f:
-                    shutil.copyfileobj(f, self.wfile)
-                
-                if hasattr(self.server, 'app'):
-                    self.server.app.update_status(f"File downloaded: {filename}")
-            else:
-                self.send_404()
-                
-        except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            error_html = f"<h1>Download Error</h1><p>{str(e)}</p>"
-            self.wfile.write(error_html.encode())
-    
-    def send_status(self):
-        """Send current status as JSON"""
-        try:
-            files = []
-            if hasattr(self.server, 'shared_folder'):
-                for filename in os.listdir(self.server.shared_folder):
-                    filepath = os.path.join(self.server.shared_folder, filename)
-                    if os.path.isfile(filepath):
-                        files.append({
-                            'name': filename,
-                            'size': os.path.getsize(filepath)
-                        })
-            
-            response = {'files': files}
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(response).encode())
-            
-        except Exception as e:
-            self.send_response(500)
-            self.end_headers()
-    
-    def send_404(self):
-        """Send 404 error"""
-        self.send_response(404)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        html = "<h1>404 - Page Not Found</h1><a href='/'>Go Home</a>"
-        self.wfile.write(html.encode())
-    
-    def log_message(self, format, *args):
-        """Override to suppress server logs"""
-        pass
-
-class FileTransferApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("LAN File Transfer")
-        self.root.geometry("800x600")
-        self.root.resizable(True, True)
+class LANChatServer:
+    def __init__(self):
+        self.app = Flask(__name__)
+        self.app.secret_key = str(uuid.uuid4())
+        self.socketio = SocketIO(self.app, cors_allowed_origins="*")
         
-        # Variables
-        self.server = None
-        self.server_thread = None
-        self.ngrok_process = None
-        self.shared_folder = tempfile.mkdtemp(prefix="file_transfer_")
-        self.discovered_devices = []
+        # Configuration
+        self.UPLOAD_FOLDER = 'shared_files'
+        self.app.config['UPLOAD_FOLDER'] = self.UPLOAD_FOLDER
+        self.app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
         
-        # Setup GUI
-        self.setup_gui()
+        # Data storage
+        self.connected_users = {}
+        self.chat_history = []
+        self.server_stats = {
+            'total_messages': 0,
+            'total_files_shared': 0,
+            'active_users': 0
+        }
         
-        # Get local IP
-        self.local_ip = self.get_local_ip()
-        self.port = 8000
+        # Create upload folder
+        os.makedirs(self.UPLOAD_FOLDER, exist_ok=True)
         
-        # Start server automatically
-        self.start_server()
-    
-    def setup_gui(self):
-        """Setup the GUI components"""
-        # Main notebook for tabs
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        self.setup_routes()
+        self.setup_socket_events()
         
-        # Tab 1: Device Discovery & File Transfer
-        transfer_frame = ttk.Frame(notebook)
-        notebook.add(transfer_frame, text="File Transfer")
-        
-        # Device Discovery Section
-        discovery_frame = ttk.LabelFrame(transfer_frame, text="Device Discovery", padding=10)
-        discovery_frame.pack(fill='x', pady=(0, 10))
-        
-        ttk.Button(discovery_frame, text="🔍 Scan Network", 
-                  command=self.scan_devices).pack(side='left', padx=(0, 10))
-        
-        self.device_var = tk.StringVar()
-        self.device_combo = ttk.Combobox(discovery_frame, textvariable=self.device_var, 
-                                        state='readonly', width=30)
-        self.device_combo.pack(side='left', padx=(0, 10))
-        
-        ttk.Button(discovery_frame, text="📤 Send File", 
-                  command=self.send_file_to_device).pack(side='left', padx=(0, 5))
-        ttk.Button(discovery_frame, text="📥 Request File", 
-                  command=self.request_file_from_device).pack(side='left')
-        
-        # Local Server Section
-        server_frame = ttk.LabelFrame(transfer_frame, text="Local Server", padding=10)
-        server_frame.pack(fill='x', pady=(0, 10))
-        
-        self.server_status = tk.StringVar(value="Server: Stopped")
-        ttk.Label(server_frame, textvariable=self.server_status).pack(anchor='w')
-        
-        self.server_url = tk.StringVar()
-        url_frame = ttk.Frame(server_frame)
-        url_frame.pack(fill='x', pady=(5, 0))
-        
-        ttk.Label(url_frame, text="Local URL:").pack(side='left')
-        url_entry = ttk.Entry(url_frame, textvariable=self.server_url, state='readonly')
-        url_entry.pack(side='left', fill='x', expand=True, padx=(5, 5))
-        
-        ttk.Button(url_frame, text="📋 Copy", 
-                  command=self.copy_url).pack(side='right', padx=(0, 5))
-        ttk.Button(url_frame, text="🌐 Open", 
-                  command=self.open_url).pack(side='right')
-        
-        # Internet Sharing Section
-        internet_frame = ttk.LabelFrame(transfer_frame, text="Internet Sharing (ngrok)", padding=10)
-        internet_frame.pack(fill='x', pady=(0, 10))
-        
-        self.ngrok_status = tk.StringVar(value="ngrok: Not active")
-        ttk.Label(internet_frame, textvariable=self.ngrok_status).pack(anchor='w')
-        
-        self.ngrok_url = tk.StringVar()
-        ngrok_url_frame = ttk.Frame(internet_frame)
-        ngrok_url_frame.pack(fill='x', pady=(5, 0))
-        
-        ttk.Label(ngrok_url_frame, text="Public URL:").pack(side='left')
-        ngrok_entry = ttk.Entry(ngrok_url_frame, textvariable=self.ngrok_url, state='readonly')
-        ngrok_entry.pack(side='left', fill='x', expand=True, padx=(5, 5))
-        
-        ttk.Button(ngrok_url_frame, text="📋 Copy", 
-                  command=self.copy_ngrok_url).pack(side='right', padx=(0, 5))
-        ttk.Button(ngrok_url_frame, text="🌐 Open", 
-                  command=self.open_ngrok_url).pack(side='right')
-        
-        ngrok_controls = ttk.Frame(internet_frame)
-        ngrok_controls.pack(fill='x', pady=(5, 0))
-        
-        ttk.Button(ngrok_controls, text="🚀 Start ngrok", 
-                  command=self.start_ngrok).pack(side='left', padx=(0, 5))
-        ttk.Button(ngrok_controls, text="⏹️ Stop ngrok", 
-                  command=self.stop_ngrok).pack(side='left')
-        
-        # File Management Section
-        files_frame = ttk.LabelFrame(transfer_frame, text="Shared Files", padding=10)
-        files_frame.pack(fill='both', expand=True)
-        
-        file_controls = ttk.Frame(files_frame)
-        file_controls.pack(fill='x', pady=(0, 10))
-        
-        ttk.Button(file_controls, text="➕ Add Files", 
-                  command=self.add_files).pack(side='left', padx=(0, 5))
-        ttk.Button(file_controls, text="📁 Open Folder", 
-                  command=self.open_shared_folder).pack(side='left', padx=(0, 5))
-        ttk.Button(file_controls, text="🗑️ Clear All", 
-                  command=self.clear_files).pack(side='left')
-        
-        # File list
-        self.file_tree = ttk.Treeview(files_frame, columns=('Size', 'Modified'), show='tree headings')
-        self.file_tree.heading('#0', text='File Name')
-        self.file_tree.heading('Size', text='Size')
-        self.file_tree.heading('Modified', text='Modified')
-        self.file_tree.column('#0', width=300)
-        self.file_tree.column('Size', width=100)
-        self.file_tree.column('Modified', width=150)
-        
-        file_scroll = ttk.Scrollbar(files_frame, orient='vertical', command=self.file_tree.yview)
-        self.file_tree.configure(yscrollcommand=file_scroll.set)
-        
-        self.file_tree.pack(side='left', fill='both', expand=True)
-        file_scroll.pack(side='right', fill='y')
-        
-        # Tab 2: Status & Logs
-        status_frame = ttk.Frame(notebook)
-        notebook.add(status_frame, text="Status & Logs")
-        
-        self.status_text = scrolledtext.ScrolledText(status_frame, height=20)
-        self.status_text.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Add initial status
-        self.update_status("Application started")
-        self.update_status(f"Shared folder: {self.shared_folder}")
-    
     def get_local_ip(self):
-        """Get the local IP address"""
         try:
-            # Connect to a remote server to get local IP
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(("8.8.8.8", 80))
-                return s.getsockname()[0]
+            # Connect to a remote address to determine local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
         except:
             return "127.0.0.1"
     
-    def start_server(self):
-        """Start the HTTP server"""
-        try:
-            self.server = HTTPServer((self.local_ip, self.port), FileTransferServer)
-            self.server.shared_folder = self.shared_folder
-            self.server.app = self
+    def setup_routes(self):
+        @self.app.route('/')
+        def index():
+            if 'username' not in session:
+                return redirect(url_for('login'))
+            return render_template('index.html', username=session['username'])
+        
+        @self.app.route('/login', methods=['GET', 'POST'])
+        def login():
+            if request.method == 'POST':
+                username = request.form.get('username', '').strip()
+                if username and len(username) <= 20:
+                    session['username'] = username
+                    return redirect(url_for('index'))
+                else:
+                    return render_template('login.html', error='Please enter a valid username (1-20 characters)')
+            return render_template('login.html')
+        
+        @self.app.route('/logout')
+        def logout():
+            username = session.get('username')
+            if username and username in self.connected_users:
+                del self.connected_users[username]
+                self.server_stats['active_users'] = len(self.connected_users)
+            session.clear()
+            return redirect(url_for('login'))
+        
+        @self.app.route('/upload', methods=['POST'])
+        def upload_file():
+            if 'file' not in request.files:
+                return jsonify({'error': 'No file selected'})
             
-            self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-            self.server_thread.start()
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'error': 'No file selected'})
             
-            url = f"http://{self.local_ip}:{self.port}"
-            self.server_url.set(url)
-            self.server_status.set(f"Server: Running on {self.local_ip}:{self.port}")
-            self.update_status(f"Server started: {url}")
-            
-        except Exception as e:
-            self.update_status(f"Error starting server: {str(e)}")
-            messagebox.showerror("Server Error", f"Failed to start server: {str(e)}")
+            if file:
+                filename = secure_filename(file.filename)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_')
+                filename = timestamp + filename
+                file_path = os.path.join(self.app.config['UPLOAD_FOLDER'], filename)
+                file.save(file_path)
+                
+                self.server_stats['total_files_shared'] += 1
+                
+                # Notify all users about new file
+                self.socketio.emit('file_uploaded', {
+                    'filename': filename,
+                    'original_name': file.filename,
+                    'uploader': session.get('username', 'Anonymous'),
+                    'timestamp': datetime.now().strftime('%H:%M:%S')
+                })
+                
+                return jsonify({'success': True, 'filename': filename})
+        
+        @self.app.route('/download/<filename>')
+        def download_file(filename):
+            try:
+                return send_file(os.path.join(self.UPLOAD_FOLDER, filename), as_attachment=True)
+            except:
+                return "File not found", 404
+        
+        @self.app.route('/files')
+        def list_files():
+            try:
+                files = []
+                for filename in os.listdir(self.UPLOAD_FOLDER):
+                    file_path = os.path.join(self.UPLOAD_FOLDER, filename)
+                    if os.path.isfile(file_path):
+                        file_stat = os.stat(file_path)
+                        files.append({
+                            'name': filename,
+                            'size': file_stat.st_size,
+                            'modified': datetime.fromtimestamp(file_stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                        })
+                return jsonify(files)
+            except:
+                return jsonify([])
     
-    def scan_devices(self):
-        """Scan for devices on the local network"""
-        def scan_thread():
-            self.update_status("Scanning network for devices...")
-            devices = []
+    def setup_socket_events(self):
+        @self.socketio.on('connect')
+        def handle_connect():
+            username = session.get('username')
+            if username:
+                self.connected_users[username] = {
+                    'sid': request.sid,
+                    'joined': datetime.now().strftime('%H:%M:%S')
+                }
+                self.server_stats['active_users'] = len(self.connected_users)
+                
+                join_room('main_room')
+                
+                # Send chat history to new user
+                emit('chat_history', self.chat_history)
+                
+                # Notify others
+                emit('user_joined', {
+                    'username': username,
+                    'timestamp': datetime.now().strftime('%H:%M:%S'),
+                    'total_users': len(self.connected_users)
+                }, room='main_room')
+        
+        @self.socketio.on('disconnect')
+        def handle_disconnect():
+            username = session.get('username')
+            if username and username in self.connected_users:
+                del self.connected_users[username]
+                self.server_stats['active_users'] = len(self.connected_users)
+                
+                emit('user_left', {
+                    'username': username,
+                    'timestamp': datetime.now().strftime('%H:%M:%S'),
+                    'total_users': len(self.connected_users)
+                }, room='main_room')
+        
+        @self.socketio.on('send_message')
+        def handle_message(data):
+            username = session.get('username')
+            if username:
+                message_data = {
+                    'username': username,
+                    'message': data['message'][:500],  # Limit message length
+                    'timestamp': datetime.now().strftime('%H:%M:%S'),
+                    'id': str(uuid.uuid4())
+                }
+                
+                self.chat_history.append(message_data)
+                if len(self.chat_history) > 100:  # Keep only last 100 messages
+                    self.chat_history.pop(0)
+                
+                self.server_stats['total_messages'] += 1
+                
+                emit('new_message', message_data, room='main_room')
+        
+        @self.socketio.on('request_user_list')
+        def handle_user_list():
+            emit('user_list', {
+                'users': list(self.connected_users.keys()),
+                'total': len(self.connected_users)
+            })
+    
+    def create_templates(self):
+        # Create templates directory
+        os.makedirs('templates', exist_ok=True)
+        
+        # Login page template
+        login_html = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LAN Chat & File Share - Login</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Tahoma, Arial, sans-serif;
+            background: linear-gradient(45deg, #1e3c72, #2a5298);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .login-container {
+            background: #f0f0f0;
+            border: 3px outset #cccccc;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 5px 5px 15px rgba(0,0,0,0.3);
+            width: 400px;
+            text-align: center;
+        }
+        
+        .login-container h1 {
+            color: #2c5aa0;
+            font-size: 24px;
+            margin-bottom: 10px;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
+        }
+        
+        .login-container h2 {
+            color: #666;
+            font-size: 16px;
+            margin-bottom: 25px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        input[type="text"] {
+            width: 100%;
+            padding: 8px;
+            border: 2px inset #cccccc;
+            border-radius: 3px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        
+        .btn {
+            background: linear-gradient(to bottom, #4CAF50, #45a049);
+            border: 2px outset #4CAF50;
+            color: white;
+            padding: 10px 25px;
+            font-size: 14px;
+            font-weight: bold;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        
+        .btn:hover {
+            background: linear-gradient(to bottom, #45a049, #4CAF50);
+            border: 2px inset #4CAF50;
+        }
+        
+        .btn:active {
+            border: 2px inset #cccccc;
+        }
+        
+        .error {
+            color: #d32f2f;
+            background: #ffebee;
+            border: 1px solid #e57373;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+        }
+        
+        .info-panel {
+            background: #e3f2fd;
+            border: 1px solid #90caf9;
+            border-radius: 5px;
+            padding: 15px;
+            margin-top: 20px;
+            text-align: left;
+        }
+        
+        .info-panel h3 {
+            margin-top: 0;
+            color: #1976d2;
+            font-size: 14px;
+        }
+        
+        .info-panel ul {
+            margin: 5px 0;
+            padding-left: 20px;
+            font-size: 12px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>LAN Chat & File Share</h1>
+        <h2>Enter your name to join</h2>
+        
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        
+        <form method="POST">
+            <div class="form-group">
+                <label for="username">Your Name:</label>
+                <input type="text" id="username" name="username" maxlength="20" required 
+                       placeholder="Enter your name..." autocomplete="off">
+            </div>
+            <button type="submit" class="btn">Join Chat</button>
+        </form>
+        
+        <div class="info-panel">
+            <h3>Features Available:</h3>
+            <ul>
+                <li>Real-time group chat</li>
+                <li>File sharing (up to 500MB)</li>
+                <li>See who's online</li>
+                <li>Download shared files</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>'''
+
+        # Main application template
+        main_html = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LAN Chat & File Share</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Tahoma, Arial, sans-serif;
+            background: linear-gradient(to bottom, #87CEEB, #98D4E8);
+            min-height: 100vh;
+        }
+        
+        .header {
+            background: linear-gradient(to bottom, #2c5aa0, #1e3c72);
+            color: white;
+            padding: 10px 20px;
+            border-bottom: 3px solid #1a252f;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 20px;
+            display: inline-block;
+        }
+        
+        .header-info {
+            float: right;
+            font-size: 12px;
+            margin-top: 3px;
+        }
+        
+        .main-container {
+            display: flex;
+            height: calc(100vh - 70px);
+            gap: 10px;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        
+        .chat-panel, .file-panel {
+            background: #f0f0f0;
+            border: 3px outset #cccccc;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 3px 3px 8px rgba(0,0,0,0.2);
+        }
+        
+        .chat-panel {
+            flex: 2;
+            min-width: 400px;
+        }
+        
+        .file-panel {
+            flex: 1;
+            min-width: 300px;
+        }
+        
+        .panel-header {
+            background: linear-gradient(to bottom, #dcdcdc, #c0c0c0);
+            border-bottom: 2px solid #999;
+            padding: 8px 15px;
+            font-weight: bold;
+            color: #333;
+            border-radius: 5px 5px 0 0;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            background: white;
+            border: 2px inset #cccccc;
+            margin: 5px;
+            font-size: 13px;
+        }
+        
+        .message {
+            margin-bottom: 8px;
+            padding: 5px 8px;
+            border-radius: 3px;
+            background: #f8f8f8;
+            border-left: 3px solid #4CAF50;
+        }
+        
+        .message.system {
+            background: #fff3cd;
+            border-left-color: #ffc107;
+            font-style: italic;
+            color: #856404;
+        }
+        
+        .message-header {
+            font-weight: bold;
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 2px;
+        }
+        
+        .message-content {
+            color: #333;
+        }
+        
+        .chat-input {
+            display: flex;
+            padding: 10px;
+            gap: 5px;
+            background: #e0e0e0;
+            border-top: 2px solid #999;
+        }
+        
+        .chat-input input {
+            flex: 1;
+            padding: 8px;
+            border: 2px inset #cccccc;
+            border-radius: 3px;
+            font-size: 13px;
+        }
+        
+        .btn {
+            background: linear-gradient(to bottom, #4CAF50, #45a049);
+            border: 2px outset #4CAF50;
+            color: white;
+            padding: 8px 15px;
+            font-size: 12px;
+            font-weight: bold;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        
+        .btn:hover {
+            background: linear-gradient(to bottom, #45a049, #4CAF50);
+        }
+        
+        .btn:active {
+            border: 2px inset #cccccc;
+        }
+        
+        .btn-secondary {
+            background: linear-gradient(to bottom, #2196F3, #1976D2);
+            border: 2px outset #2196F3;
+        }
+        
+        .btn-secondary:hover {
+            background: linear-gradient(to bottom, #1976D2, #2196F3);
+        }
+        
+        .btn-danger {
+            background: linear-gradient(to bottom, #f44336, #d32f2f);
+            border: 2px outset #f44336;
+        }
+        
+        .btn-danger:hover {
+            background: linear-gradient(to bottom, #d32f2f, #f44336);
+        }
+        
+        .file-upload {
+            padding: 15px;
+            border-bottom: 1px solid #ccc;
+        }
+        
+        .file-input {
+            margin-bottom: 10px;
+        }
+        
+        .file-input input[type="file"] {
+            width: 100%;
+            padding: 5px;
+            border: 2px inset #cccccc;
+            background: white;
+            font-size: 12px;
+        }
+        
+        .file-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            background: white;
+            border: 2px inset #cccccc;
+            margin: 5px;
+        }
+        
+        .file-item {
+            background: #f8f8f8;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            padding: 8px;
+            margin-bottom: 5px;
+            font-size: 12px;
+        }
+        
+        .file-item:hover {
+            background: #e8e8e8;
+        }
+        
+        .file-name {
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 3px;
+            word-break: break-word;
+        }
+        
+        .file-info {
+            color: #666;
+            font-size: 11px;
+        }
+        
+        .online-users {
+            background: #e8f4fd;
+            border: 1px solid #90caf9;
+            border-radius: 5px;
+            padding: 10px;
+            margin: 10px;
+            font-size: 12px;
+        }
+        
+        .online-users h4 {
+            margin: 0 0 8px 0;
+            color: #1976d2;
+            font-size: 13px;
+        }
+        
+        .user-list {
+            color: #555;
+        }
+        
+        .status-bar {
+            background: #f0f0f0;
+            border-top: 1px solid #ccc;
+            padding: 5px 10px;
+            font-size: 11px;
+            color: #666;
+            text-align: center;
+        }
+        
+        .upload-progress {
+            display: none;
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 3px;
+            font-size: 12px;
+            color: #856404;
+        }
+        
+        @media (max-width: 768px) {
+            .main-container {
+                flex-direction: column;
+                height: auto;
+            }
             
-            # Get network range
-            ip_parts = self.local_ip.split('.')
-            network = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}"
+            .chat-panel, .file-panel {
+                min-width: auto;
+                height: 300px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>LAN Chat & File Share</h1>
+        <div class="header-info">
+            Welcome, <strong>{{ username }}</strong> | 
+            <a href="/logout" style="color: #87CEEB;">Logout</a>
+        </div>
+        <div style="clear: both;"></div>
+    </div>
+    
+    <div class="main-container">
+        <div class="chat-panel">
+            <div class="panel-header">Chat Room</div>
+            <div class="chat-messages" id="chatMessages"></div>
+            <div class="chat-input">
+                <input type="text" id="messageInput" placeholder="Type your message..." maxlength="500">
+                <button class="btn" onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+        
+        <div class="file-panel">
+            <div class="panel-header">File Sharing</div>
             
-            # Scan common ports
-            for i in range(1, 255):
-                if i == int(ip_parts[3]):  # Skip own IP
-                    continue
+            <div class="file-upload">
+                <div class="file-input">
+                    <input type="file" id="fileInput" multiple>
+                </div>
+                <button class="btn btn-secondary" onclick="uploadFile()">Upload Files</button>
+                <div class="upload-progress" id="uploadProgress">Uploading...</div>
+            </div>
+            
+            <div class="online-users">
+                <h4>Online Users (<span id="userCount">0</span>)</h4>
+                <div class="user-list" id="userList">Loading...</div>
+            </div>
+            
+            <div class="file-list" id="fileList">Loading files...</div>
+        </div>
+    </div>
+    
+    <div class="status-bar">
+        <span id="connectionStatus">Connecting...</span>
+    </div>
+    
+    <script>
+        const socket = io();
+        let username = "{{ username }}";
+        
+        // Socket event handlers
+        socket.on('connect', function() {
+            document.getElementById('connectionStatus').textContent = 'Connected to server';
+            socket.emit('request_user_list');
+            loadFiles();
+        });
+        
+        socket.on('disconnect', function() {
+            document.getElementById('connectionStatus').textContent = 'Disconnected from server';
+        });
+        
+        socket.on('chat_history', function(history) {
+            const messagesDiv = document.getElementById('chatMessages');
+            messagesDiv.innerHTML = '';
+            history.forEach(msg => addMessage(msg));
+        });
+        
+        socket.on('new_message', function(data) {
+            addMessage(data);
+        });
+        
+        socket.on('user_joined', function(data) {
+            addSystemMessage(data.username + " joined the chat", data.timestamp);
+            updateUserCount(data.total_users);
+            socket.emit('request_user_list');
+        });
+        
+        socket.on('user_left', function(data) {
+            addSystemMessage(data.username + " left the chat", data.timestamp);
+            updateUserCount(data.total_users);
+            socket.emit('request_user_list');
+        });
+        
+        socket.on('user_list', function(data) {
+            updateUserList(data.users);
+            updateUserCount(data.total);
+        });
+        
+        socket.on('file_uploaded', function(data) {
+            addSystemMessage(data.uploader + " shared a file: " + data.original_name, data.timestamp);
+            loadFiles();
+        });
+        
+        // Chat functions
+        function addMessage(data) {
+            const messagesDiv = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message';
+            
+            messageDiv.innerHTML = `
+                <div class="message-header">${data.username} - ${data.timestamp}</div>
+                <div class="message-content">${escapeHtml(data.message)}</div>
+            `;
+            
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function addSystemMessage(message, timestamp) {
+            const messagesDiv = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message system';
+            
+            messageDiv.innerHTML = `
+                <div class="message-header">System - ${timestamp}</div>
+                <div class="message-content">${message}</div>
+            `;
+            
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            
+            if (message) {
+                socket.emit('send_message', { message: message });
+                input.value = '';
+            }
+        }
+        
+        // File functions
+        function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const files = fileInput.files;
+            
+            if (files.length === 0) {
+                alert('Please select files to upload');
+                return;
+            }
+            
+            const progress = document.getElementById('uploadProgress');
+            progress.style.display = 'block';
+            
+            // Upload files one by one
+            uploadNextFile(files, 0, progress);
+        }
+        
+        function uploadNextFile(files, index, progressDiv) {
+            if (index >= files.length) {
+                progressDiv.style.display = 'none';
+                document.getElementById('fileInput').value = '';
+                return;
+            }
+            
+            const file = files[index];
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            progressDiv.textContent = `Uploading ${file.name} (${index + 1}/${files.length})...`;
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    alert('Upload failed: ' + data.error);
+                }
+                uploadNextFile(files, index + 1, progressDiv);
+            })
+            .catch(error => {
+                alert('Upload failed: ' + error);
+                uploadNextFile(files, index + 1, progressDiv);
+            });
+        }
+        
+        function loadFiles() {
+            fetch('/files')
+            .then(response => response.json())
+            .then(files => {
+                const fileList = document.getElementById('fileList');
+                if (files.length === 0) {
+                    fileList.innerHTML = '<div style="text-align: center; color: #666; padding: 20px;">No files shared yet</div>';
+                    return;
+                }
+                
+                fileList.innerHTML = '';
+                files.forEach(file => {
+                    const fileDiv = document.createElement('div');
+                    fileDiv.className = 'file-item';
                     
-                target_ip = f"{network}.{i}"
-                
-                # Check if device responds on common HTTP ports
-                for port in [80, 8000, 8080, 3000, 5000]:
-                    try:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(0.1)
-                        result = sock.connect_ex((target_ip, port))
-                        sock.close()
-                        
-                        if result == 0:
-                            devices.append(f"{target_ip}:{port}")
-                            break
-                    except:
-                        continue
-            
-            # Update GUI in main thread
-            self.root.after(0, self.update_device_list, devices)
+                    const displayName = file.name.substring(16); // Remove timestamp prefix
+                    const fileSize = formatFileSize(file.size);
+                    
+                    fileDiv.innerHTML = `
+                        <div class="file-name">${escapeHtml(displayName)}</div>
+                        <div class="file-info">Size: ${fileSize} | Modified: ${file.modified}</div>
+                        <button class="btn btn-secondary" style="margin-top: 5px; font-size: 11px;" 
+                                onclick="downloadFile('${file.name}')">Download</button>
+                    `;
+                    
+                    fileList.appendChild(fileDiv);
+                });
+            });
+        }
         
-        threading.Thread(target=scan_thread, daemon=True).start()
+        function downloadFile(filename) {
+            window.open('/download/' + encodeURIComponent(filename), '_blank');
+        }
+        
+        function updateUserList(users) {
+            const userList = document.getElementById('userList');
+            if (users.length === 0) {
+                userList.textContent = 'No users online';
+            } else {
+                userList.textContent = users.join(', ');
+            }
+        }
+        
+        function updateUserCount(count) {
+            document.getElementById('userCount').textContent = count;
+        }
+        
+        // Utility functions
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+        
+        // Event listeners
+        document.getElementById('messageInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        // Load files on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadFiles();
+        });
+    </script>
+</body>
+</html>'''
+        
+        # Write templates
+        with open('templates/login.html', 'w', encoding='utf-8') as f:
+            f.write(login_html)
+        
+        with open('templates/index.html', 'w', encoding='utf-8') as f:
+            f.write(main_html)
     
-    def update_device_list(self, devices):
-        """Update the device list in the GUI"""
-        self.discovered_devices = devices
-        self.device_combo['values'] = devices
-        
-        if devices:
-            self.update_status(f"Found {len(devices)} devices: {', '.join(devices)}")
-        else:
-            self.update_status("No devices found on network")
-    
-    def send_file_to_device(self):
-        """Send a file to selected device"""
-        if not self.device_var.get():
-            messagebox.showwarning("No Device", "Please select a device first")
-            return
-        
-        files = filedialog.askopenfilenames(title="Select files to send")
-        if not files:
-            return
-        
-        device = self.device_var.get()
-        self.update_status(f"Attempting to send files to {device}")
-        
-        # For now, show instructions to user
-        message = f"""To send files to {device}:
-
-1. Copy this URL and share it with the target device:
-   {self.server_url.get()}
-
-2. The other device can visit this URL to download your files.
-
-Files ready to send: {', '.join(os.path.basename(f) for f in files)}"""
-
-        # Copy files to shared folder
-        for file_path in files:
+    def run_gui(self):
+        def start_server():
             try:
-                filename = os.path.basename(file_path)
-                dest_path = os.path.join(self.shared_folder, filename)
-                shutil.copy2(file_path, dest_path)
-                self.update_status(f"Added file to share: {filename}")
-            except Exception as e:
-                self.update_status(f"Error copying file {filename}: {str(e)}")
-        
-        self.refresh_file_list()
-        messagebox.showinfo("Files Ready", message)
-    
-    def request_file_from_device(self):
-        """Request a file from selected device"""
-        if not self.device_var.get():
-            messagebox.showwarning("No Device", "Please select a device first")
-            return
-        
-        device = self.device_var.get()
-        url = f"http://{device}"
-        
-        message = f"""To request files from {device}:
-
-1. Ask the other device to visit: {self.server_url.get()}
-2. They can upload files through the web interface
-3. Or try accessing their server at: {url}"""
-        
-        self.update_status(f"File request setup for {device}")
-        messagebox.showinfo("File Request", message)
-        
-        # Try to open the device's potential server
-        try:
-            webbrowser.open(url)
-        except:
-            pass
-    
-    def start_ngrok(self):
-        """Start ngrok tunnel"""
-        def start_ngrok_thread():
-            try:
-                # Check if ngrok is installed
-                result = subprocess.run(['ngrok', 'version'], capture_output=True, text=True)
-                if result.returncode != 0:
-                    self.root.after(0, lambda: messagebox.showerror("ngrok Error", 
-                        "ngrok is not installed. Please install ngrok first:\n"
-                        "1. Download from https://ngrok.com/download\n"
-                        "2. Extract and add to PATH\n"
-                        "3. Sign up and set auth token"))
-                    return
+                host = self.get_local_ip()
+                port = int(port_var.get())
                 
-                # Start ngrok
-                self.ngrok_process = subprocess.Popen(
-                    ['ngrok', 'http', str(self.port)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+                # Update server info
+                server_url = f"http://{host}:{port}"
+                url_label.config(text=f"Server URL: {server_url}")
+                
+                # Start server in separate thread
+                server_thread = threading.Thread(
+                    target=lambda: self.socketio.run(self.app, host='0.0.0.0', port=port, debug=False),
+                    daemon=True
                 )
+                server_thread.start()
                 
-                time.sleep(3)  # Wait for ngrok to start
+                start_btn.config(state='disabled')
+                stop_btn.config(state='normal')
+                status_label.config(text="Server Status: Running", fg="green")
                 
-                # Get ngrok URL
-                try:
-                    response = requests.get('http://localhost:4040/api/tunnels')
-                    data = response.json()
-                    
-                    if data['tunnels']:
-                        public_url = data['tunnels'][0]['public_url']
-                        self.root.after(0, lambda: self.ngrok_url.set(public_url))
-                        self.root.after(0, lambda: self.ngrok_status.set("ngrok: Active"))
-                        self.root.after(0, lambda: self.update_status(f"ngrok tunnel started: {public_url}"))
-                    else:
-                        raise Exception("No tunnels found")
-                        
-                except Exception as e:
-                    self.root.after(0, lambda: self.update_status(f"Error getting ngrok URL: {str(e)}"))
+                # Start stats update
+                update_stats()
                 
             except Exception as e:
-                self.root.after(0, lambda: self.update_status(f"Error starting ngrok: {str(e)}"))
-                self.root.after(0, lambda: messagebox.showerror("ngrok Error", str(e)))
+                messagebox.showerror("Error", f"Failed to start server: {str(e)}")
         
-        threading.Thread(target=start_ngrok_thread, daemon=True).start()
-    
-    def stop_ngrok(self):
-        """Stop ngrok tunnel"""
-        if self.ngrok_process:
-            self.ngrok_process.terminate()
-            self.ngrok_process = None
-            self.ngrok_url.set("")
-            self.ngrok_status.set("ngrok: Not active")
-            self.update_status("ngrok tunnel stopped")
-    
-    def add_files(self):
-        """Add files to shared folder"""
-        files = filedialog.askopenfilenames(title="Select files to share")
-        if not files:
-            return
-        
-        for file_path in files:
+        def stop_server():
             try:
-                filename = os.path.basename(file_path)
-                dest_path = os.path.join(self.shared_folder, filename)
-                shutil.copy2(file_path, dest_path)
-                self.update_status(f"Added file: {filename}")
+                start_btn.config(state='normal')
+                stop_btn.config(state='disabled')
+                status_label.config(text="Server Status: Stopped", fg="red")
+                url_label.config(text="Server URL: Not running")
+                messagebox.showinfo("Server", "Server stopped. Note: You may need to restart the application to start the server again.")
             except Exception as e:
-                self.update_status(f"Error adding file {filename}: {str(e)}")
+                messagebox.showerror("Error", f"Error stopping server: {str(e)}")
         
-        self.refresh_file_list()
-    
-    def clear_files(self):
-        """Clear all shared files"""
-        try:
-            for filename in os.listdir(self.shared_folder):
-                file_path = os.path.join(self.shared_folder, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-            
-            self.refresh_file_list()
-            self.update_status("All files cleared")
-        except Exception as e:
-            self.update_status(f"Error clearing files: {str(e)}")
-    
-    def open_shared_folder(self):
-        """Open the shared folder in file explorer"""
-        try:
-            if platform.system() == "Windows":
-                os.startfile(self.shared_folder)
-            elif platform.system() == "Darwin":  # macOS
-                subprocess.run(["open", self.shared_folder])
-            else:  # Linux
-                subprocess.run(["xdg-open", self.shared_folder])
-        except Exception as e:
-            self.update_status(f"Error opening folder: {str(e)}")
-    
-    def refresh_file_list(self):
-        """Refresh the file list display"""
-        # Clear existing items
-        for item in self.file_tree.get_children():
-            self.file_tree.delete(item)
+        def update_stats():
+            if status_label.cget("text") == "Server Status: Running":
+                # Update statistics
+                stats_text.delete(1.0, tk.END)
+                stats_content = f"""=== SERVER STATISTICS ===
+Active Users: {self.server_stats['active_users']}
+Total Messages Sent: {self.server_stats['total_messages']}
+Files Shared: {self.server_stats['total_files_shared']}
+Server Uptime: {datetime.now().strftime('%H:%M:%S')}
+
+=== CONNECTED USERS ===
+"""
+                if self.connected_users:
+                    for username, info in self.connected_users.items():
+                        stats_content += f"• {username} (joined: {info['joined']})\n"
+                else:
+                    stats_content += "No users connected\n"
+                
+                stats_content += f"\n=== RECENT CHAT ACTIVITY ===\n"
+                if self.chat_history:
+                    for msg in self.chat_history[-5:]:  # Last 5 messages
+                        stats_content += f"[{msg['timestamp']}] {msg['username']}: {msg['message'][:50]}{'...' if len(msg['message']) > 50 else ''}\n"
+                else:
+                    stats_content += "No recent messages\n"
+                
+                stats_text.insert(tk.END, stats_content)
+                
+                # Schedule next update
+                root.after(2000, update_stats)
         
-        # Add current files
-        try:
-            for filename in os.listdir(self.shared_folder):
-                file_path = os.path.join(self.shared_folder, filename)
-                if os.path.isfile(file_path):
-                    size = os.path.getsize(file_path)
-                    modified = datetime.fromtimestamp(os.path.getmtime(file_path))
-                    
-                    # Format size
-                    if size < 1024:
-                        size_str = f"{size} B"
-                    elif size < 1024*1024:
-                        size_str = f"{size/1024:.1f} KB"
-                    else:
-                        size_str = f"{size/(1024*1024):.1f} MB"
-                    
-                    self.file_tree.insert('', 'end', text=filename, 
-                                        values=(size_str, modified.strftime("%Y-%m-%d %H:%M")))
-        except Exception as e:
-            self.update_status(f"Error refreshing file list: {str(e)}")
-    
-    def copy_url(self):
-        """Copy local URL to clipboard"""
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.server_url.get())
-        self.update_status("Local URL copied to clipboard")
-    
-    def copy_ngrok_url(self):
-        """Copy ngrok URL to clipboard"""
-        if self.ngrok_url.get():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self.ngrok_url.get())
-            self.update_status("Public URL copied to clipboard")
-    
-    def open_url(self):
-        """Open local URL in browser"""
-        webbrowser.open(self.server_url.get())
-    
-    def open_ngrok_url(self):
-        """Open ngrok URL in browser"""
-        if self.ngrok_url.get():
-            webbrowser.open(self.ngrok_url.get())
-    
-    def update_status(self, message):
-        """Update status log"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_message = f"[{timestamp}] {message}\n"
+        def select_upload_folder():
+            folder = filedialog.askdirectory(title="Select Upload Folder")
+            if folder:
+                self.UPLOAD_FOLDER = folder
+                self.app.config['UPLOAD_FOLDER'] = folder
+                upload_folder_label.config(text=f"Upload Folder: {folder}")
         
-        self.status_text.insert(tk.END, log_message)
-        self.status_text.see(tk.END)
+        def clear_chat_history():
+            if messagebox.askyesno("Clear Chat", "Are you sure you want to clear all chat history?"):
+                self.chat_history.clear()
+                self.server_stats['total_messages'] = 0
+                messagebox.showinfo("Chat Cleared", "Chat history has been cleared.")
         
-        # Refresh file list periodically
-        self.root.after(100, self.refresh_file_list)
-    
-    def on_closing(self):
-        """Handle application closing"""
-        if self.server:
-            self.server.shutdown()
+        def clear_files():
+            if messagebox.askyesno("Clear Files", "Are you sure you want to delete all shared files?"):
+                try:
+                    for filename in os.listdir(self.UPLOAD_FOLDER):
+                        file_path = os.path.join(self.UPLOAD_FOLDER, filename)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                    self.server_stats['total_files_shared'] = 0
+                    messagebox.showinfo("Files Cleared", "All shared files have been deleted.")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to clear files: {str(e)}")
         
-        if self.ngrok_process:
-            self.ngrok_process.terminate()
+        # Create main window
+        root = tk.Tk()
+        root.title("LAN Chat & File Share Server Control")
+        root.geometry("800x600")
+        root.configure(bg="#f0f0f0")
         
-        # Clean up temp folder
-        try:
-            shutil.rmtree(self.shared_folder)
-        except:
-            pass
+        # Variables
+        port_var = tk.StringVar(value="5000")
         
-        self.root.destroy()
+        # Main frame
+        main_frame = ttk.Frame(root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Server Control Section
+        control_frame = ttk.LabelFrame(main_frame, text="Server Control", padding="10")
+        control_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Label(control_frame, text="Port:").grid(row=0, column=0, sticky=tk.W)
+        port_entry = ttk.Entry(control_frame, textvariable=port_var, width=10)
+        port_entry.grid(row=0, column=1, padx=(5, 10))
+        
+        start_btn = ttk.Button(control_frame, text="Start Server", command=start_server)
+        start_btn.grid(row=0, column=2, padx=5)
+        
+        stop_btn = ttk.Button(control_frame, text="Stop Server", command=stop_server, state='disabled')
+        stop_btn.grid(row=0, column=3, padx=5)
+        
+        status_label = ttk.Label(control_frame, text="Server Status: Stopped", foreground="red")
+        status_label.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
+        
+        url_label = ttk.Label(control_frame, text="Server URL: Not running", foreground="blue")
+        url_label.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        
+        # Configuration Section
+        config_frame = ttk.LabelFrame(main_frame, text="Configuration", padding="10")
+        config_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        upload_folder_label = ttk.Label(config_frame, text=f"Upload Folder: {self.UPLOAD_FOLDER}")
+        upload_folder_label.grid(row=0, column=0, sticky=tk.W)
+        
+        ttk.Button(config_frame, text="Change Folder", command=select_upload_folder).grid(row=0, column=1, padx=(10, 0))
+        
+        # Management Section
+        mgmt_frame = ttk.LabelFrame(main_frame, text="Management", padding="10")
+        mgmt_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Button(mgmt_frame, text="Clear Chat History", command=clear_chat_history).grid(row=0, column=0, padx=(0, 10))
+        ttk.Button(mgmt_frame, text="Clear All Files", command=clear_files).grid(row=0, column=1)
+        
+        # Statistics Section
+        stats_frame = ttk.LabelFrame(main_frame, text="Server Statistics & Activity", padding="10")
+        stats_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        stats_text = scrolledtext.ScrolledText(stats_frame, width=80, height=20, font=("Courier", 9))
+        stats_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(3, weight=1)
+        control_frame.columnconfigure(4, weight=1)
+        config_frame.columnconfigure(2, weight=1)
+        mgmt_frame.columnconfigure(2, weight=1)
+        stats_frame.columnconfigure(0, weight=1)
+        stats_frame.rowconfigure(0, weight=1)
+        
+        # Initial stats display
+        stats_text.insert(tk.END, "=== LAN CHAT & FILE SHARE SERVER ===\n\n")
+        stats_text.insert(tk.END, "Welcome to the LAN Chat & File Share Server!\n\n")
+        stats_text.insert(tk.END, "Features:\n")
+        stats_text.insert(tk.END, "• Real-time group chat\n")
+        stats_text.insert(tk.END, "• File sharing up to 500MB per file\n")
+        stats_text.insert(tk.END, "• Multiple file upload support\n")
+        stats_text.insert(tk.END, "• User presence indicators\n")
+        stats_text.insert(tk.END, "• Responsive 2000s-style web interface\n")
+        stats_text.insert(tk.END, "• Cross-platform compatibility\n\n")
+        stats_text.insert(tk.END, "Instructions:\n")
+        stats_text.insert(tk.END, "1. Click 'Start Server' to begin\n")
+        stats_text.insert(tk.END, "2. Share the Server URL with your friends\n")
+        stats_text.insert(tk.END, "3. Everyone can chat and share files!\n\n")
+        stats_text.insert(tk.END, "Server ready to start...\n")
+        
+        return root
 
 def main():
-    """Main function"""
-    root = tk.Tk()
-    app = FileTransferApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    # Create server instance
+    server = LANChatServer()
+    
+    # Create templates
+    server.create_templates()
+    
+    print("=" * 60)
+    print("LAN CHAT & FILE SHARE SERVER")
+    print("=" * 60)
+    print("Setting up server...")
+    print("Creating web templates...")
+    print("Initializing chat system...")
+    print("Ready to start!")
+    print("=" * 60)
+    
+    # Run GUI
+    root = server.run_gui()
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
 
 if __name__ == "__main__":
     main()
